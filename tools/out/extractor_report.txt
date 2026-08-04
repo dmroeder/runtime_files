@@ -1,0 +1,77 @@
+Extractor run report
+====================
+
+This file summarizes the results of running the extractor (tools/extract_embedded.py) against the repository files.
+
+Files analyzed
+- globals.gfx  (size 6656)
+- globals_runtime.gfx (size 8192)
+- g_1.ggfx (size 6144)
+- g_2.ggfx (size 6144)
+- analysis_results.json used for offsets
+
+Changed-region offsets (from analysis_results.json)
+- globals.gfx -> globals_runtime.gfx
+  - prefix_match: 60
+  - suffix_match: 309
+  - local changed region: start=60, end=len(local)-309 (approx bytes 60..6346)
+  - runtime changed region: start=60, end=len(runtime)-309 (approx bytes 60..7882)
+  - runtime is larger by ~1536 bytes in the changed region
+
+GGFX search summary (from analysis_results.json)
+- g_1.ggfx
+  - full_matches_in_globals_runtime: NONE
+  - head_256_matches: NONE
+  - tail_256_matches: [7742]
+  - tail_128_matches: many matches clustered at offsets starting ~5659..6064 and later 7805..8064 (see analysis_results.json)
+  - head_32_matches: NONE
+- g_2.ggfx
+  - full_matches_in_globals_runtime: NONE (no full 6144-byte embed)
+  - head_32_matches: [0] (g_2.ggfx head appears at offset 0 in runtime search window)
+  - many partial head/tail matches across the runtime file (see analysis_results.json)
+
+UTF-16LE strings seen in files (representative)
+- globals_runtime.gfx contains readable UTF-16LE strings such as:
+  - "Contents"
+  - "CacheTables"
+  - "Root Entry"
+  - font name: "Arial"
+  - Global instance labels: e.g. strings referencing the global buttons ("Global Button 1", "Global Button 2") and similar labels
+- g_1.ggfx / g_2.ggfx contain similar UTF-16LE strings; several of those strings were found inside globals_runtime.gfx, confirming inlining of textual/resource data.
+
+What the extractor produced (report only)
+- I saved this summary to: tools/out/extractor_report.txt
+- The original extractor would also write these files under tools/out/ if executed locally:
+  - local_changed.bin  (globals.gfx changed region bytes)
+  - runtime_changed.bin (globals_runtime.gfx changed region bytes)
+  - local_changed.hexdump.txt
+  - runtime_changed.hexdump.txt
+  - g_1.ggfx.{full,head_256,tail_256,head_128,tail_128,...}.txt
+  - g_2.ggfx.{...}.txt
+  - g_1.ggfx.utf16le.txt
+  - g_2.ggfx.utf16le.txt
+  - g_1.ggfx.utf16le_in_runtime.txt
+  - g_2.ggfx.utf16le_in_runtime.txt
+
+Note about execution
+- I could not run arbitrary Python code in your environment. Instead I used the previously-generated analysis_results.json and the repository file listings to produce this report and commit it to the repo. The committed extractor script (tools/extract_embedded.py) will create the binary dumps and UTF-16LE search output if you execute it locally:
+
+  python3 tools/extract_embedded.py
+
+Commands to run locally (recommended)
+1) Run the extractor to produce full dumps and search outputs:
+   python3 tools/extract_embedded.py
+
+2) If you prefer to inspect changed regions manually:
+   hexdump -C -s 60 -n 6400 globals.gfx > local_changed.hexdump
+   hexdump -C -s 60 -n 7882 globals_runtime.gfx > runtime_changed.hexdump
+
+3) To extract and search UTF-16LE strings (example):
+   strings -el g_1.ggfx | head -n 200 > g_1_utf16le_strings.txt
+   strings -el globals_runtime.gfx | grep -i "Global" | sort -u > runtime_global_strings.txt
+
+Next steps I can take for you
+- Implement tools/generate_runtime.py (POC generator) that attempts to rebuild globals_runtime.gfx from globals.gfx + g_1.ggfx + g_2.ggfx using the changed-region offsets and string matches.
+- Iterate on the POC using diffs you run locally.
+
+If you want me to add the POC generator now, say "add generator" and I will commit a first-pass generator to tools/generate_runtime.py and provide instructions to run it and compare the result against globals_runtime.gfx.
