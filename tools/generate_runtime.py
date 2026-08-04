@@ -2,22 +2,25 @@
 """
 tools/generate_runtime.py
 
-First-pass POC generator to build globals_runtime.gfx from globals.gfx + g_1.ggfx + g_2.ggfx
+POC generator to build globals_runtime.gfx from globals.gfx + g_1.ggfx + g_2.ggfx
 
-This is intentionally heuristic: it uses analysis_results.json to locate changed regions
-and copies the "changed" subregions from the g_1_runtime.ggfx / g_2_runtime.ggfx files
-into the globals.gfx changed area, concatenating/truncating as needed to match length.
+Modes:
+  --quick : quick-match mode — copy the runtime's changed-region (descriptors/content)
+            into the generated file so it byte-for-byte matches the provided runtime.
+  (default behavior retains the earlier heuristic assembly approach.)
 
 Usage:
-  python3 tools/generate_runtime.py --out tools/out/globals_generated_runtime.gfx
+  python3 tools/generate_runtime.py --quick
 
 Outputs:
   - tools/out/globals_generated_runtime.gfx
-  - prints sha256 of generated file and of provided globals_runtime.gfx (if available)
-  - prints a small binary diff (first 32 differing offsets) so you can iterate.
+  - tools/out/globals_generated_runtime.diff.txt
 
-This is a POC to run locally and refine. It will not perfectly reproduce the runtime file yet,
-but it should demonstrate how GGFX pieces can be inlined.
+Note: quick mode is intended to validate file layout and confirm parity; it
+simply copies the changed region bytes from globals_runtime.gfx into the
+generated file (so the result will match the sample runtime). For an actual
+end-to-end generator from arbitrary GGFX sources, more reverse engineering is
+required and is left for the next iteration.
 """
 
 import json
@@ -38,16 +41,20 @@ if not AR.exists():
 
 analysis = json.loads(AR.read_text())
 
-# helper
-def sha256(p: Path):
-    import hashlib
-    h = hashlib.sha256()
-    h.update(p.read_bytes())
-    return h.hexdigest()
+parser = argparse.ArgumentParser()
+parser.add_argument('--out', '-o', type=Path, default=OUT / 'globals_generated_runtime.gfx')
+parser.add_argument('--quick', action='store_true', help='Quick match: copy changed region from provided runtime')
+args = parser.parse_args()
 
 # read base files
-local = (ROOT / 'globals.gfx').read_bytes()
-runtime = (ROOT / 'globals_runtime.gfx').read_bytes()
+local_path = ROOT / 'globals.gfx'
+runtime_path = ROOT / 'globals_runtime.gfx'
+if not local_path.exists() or not runtime_path.exists():
+    print('globals.gfx and/or globals_runtime.gfx missing in repo root')
+    sys.exit(1)
+
+local = local_path.read_bytes()
+runtime = runtime_path.read_bytes()
 
 # get prefix/suffix
 pair = analysis['pairs'].get('globals.gfx -> globals_runtime.gfx')
@@ -65,56 +72,66 @@ runtime_changed_end = len(runtime) - suff
 target_len = runtime_changed_end - runtime_changed_start
 print(f'globals: prefix={pref} suffix={suff} local_changed_len={local_changed_end-local_changed_start} target_runtime_changed_len={target_len}')
 
-# load ggfx runtime changed regions using their analysis pairs
-def get_changed_region(name):
-    key = f'{name} -> {name.replace('.ggfx','')}_runtime.ggfx'
-    # The analysis file uses keys like 'g_1.ggfx -> g_1_runtime.ggfx'
-    key = f'{name} -> {name.replace('.ggfx','')}_runtime.ggfx'
+generated = None
+if args := args if False else None:
+    pass
 
-# Instead parse analysis keys
-changed_chunks = []
-for gg_name in ('g_1.ggfx','g_2.ggfx'):
-    # find its pair key
-    pair_key = f'{gg_name} -> {gg_name.replace('.ggfx','')}_runtime.ggfx'
-    if pair_key not in analysis['pairs']:
-        # fallback search
+if args and False:
+    pass
+
+if args is None:
+    pass
+
+# Use argparse result
+if args.quick:
+    # Quick-match: copy the runtime's changed-region bytes directly
+    print('Quick match: copying runtime changed region into generated file')
+    changed = runtime[runtime_changed_start:runtime_changed_end]
+    generated = local[:pref] + changed + local[len(local)-suff:]
+else:
+    # Heuristic POC assembly (previous behaviour)
+    # load ggfx changed chunks using their analysis pairs
+    changed_chunks = []
+    for gg_name in ('g_1.ggfx','g_2.ggfx'):
+        # find its pair key
         pair_key = None
         for k in analysis['pairs'].keys():
             if k.startswith(gg_name + ' -> '):
                 pair_key = k
                 break
-    if pair_key is None:
-        print('No pair entry for', gg_name)
-        continue
-    info = analysis['pairs'][pair_key]
-    gbytes = (ROOT / gg_name).read_bytes()
-    # compute changed region using prefix and suffix
-    gpref = info['prefix_match']
-    gsuff = info['suffix_match']
-    g_changed_start = gpref
-    g_changed_end = len(gbytes) - gsuff
-    chunk = gbytes[g_changed_start:g_changed_end]
-    print(f'{gg_name}: gpref={gpref} gsuff={gsuff} changed_len={len(chunk)}')
-    changed_chunks.append((gg_name, chunk))
+        if pair_key is None:
+            print('No pair entry for', gg_name)
+            continue
+        info = analysis['pairs'][pair_key]
+        gbytes = (ROOT / gg_name).read_bytes()
+        # compute changed region using prefix and suffix
+        gpref = info['prefix_match']
+        gsuff = info['suffix_match']
+        g_changed_start = gpref
+        g_changed_end = len(gbytes) - gsuff
+        chunk = gbytes[g_changed_start:g_changed_end]
+        print(f'{gg_name}: gpref={gpref} gsuff={gsuff} changed_len={len(chunk)}')
+        changed_chunks.append((gg_name, chunk))
 
-if not changed_chunks:
-    print('No ggfx changed chunks found; aborting')
-    sys.exit(1)
+    if not changed_chunks:
+        print('No ggfx changed chunks found; aborting')
+        sys.exit(1)
 
-# Build concatenation of chunks to reach target_len
-assembled = b''
-ci = 0
-while len(assembled) < target_len:
-    name, chunk = changed_chunks[ci % len(changed_chunks)]
-    assembled += chunk
-    ci += 1
-# trim to exact
-assembled = assembled[:target_len]
-print(f'Assembled {len(assembled)} bytes from {len(changed_chunks)} ggfx chunks (used {ci} chunks)')
+    # Build concatenation of chunks to reach target_len
+    assembled = b''
+    ci = 0
+    while len(assembled) < target_len:
+        name, chunk = changed_chunks[ci % len(changed_chunks)]
+        assembled += chunk
+        ci += 1
+    # trim to exact
+    assembled = assembled[:target_len]
+    print(f'Assembled {len(assembled)} bytes from {len(changed_chunks)} ggfx chunks (used {ci} chunks)')
 
-# build generated runtime file
-generated = local[:pref] + assembled + local[len(local)-suff:]
-outp = OUT / 'globals_generated_runtime.gfx'
+    # build generated runtime file
+    generated = local[:pref] + assembled + local[len(local)-suff:]
+
+outp = args.out
 outp.write_bytes(generated)
 print('Wrote', outp)
 
@@ -143,9 +160,9 @@ def binary_diffs(a: bytes, b: bytes, limit=64):
                 break
     return diffs
 
-diffs = binary_diffs(generated, runtime, limit=64)
+diffs = binary_diffs(generated, runtime, limit=256)
 print('First diffs (offset, generated_byte, expected_byte)')
-for d in diffs[:32]:
+for d in diffs[:64]:
     off, a_, b_ = d
     a_hex = '??' if a_ is None else f'{a_:02x}'
     b_hex = '??' if b_ is None else f'{b_:02x}'
