@@ -3,8 +3,8 @@ from pathlib import Path
 
 # Inspect small u32 values in the changed region and check whether they
 # are absolute offsets into the runtime file and what they point at.
-f = open("descriptors output.txt", "w")
-data = Path('globals_runtime.gfx').read_bytes()
+f = open("tools/out/descriptors_output.txt", "w")
+data = Path('tools/out/globals_full_generated.gfx').read_bytes()
 PREFIX = 60
 SUFFIX = 309
 changed_start = PREFIX
