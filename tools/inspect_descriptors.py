@@ -3,7 +3,7 @@ from pathlib import Path
 
 # Inspect small u32 values in the changed region and check whether they
 # are absolute offsets into the runtime file and what they point at.
-
+f = open("descriptors output.txt", "w")
 data = Path('globals_runtime.gfx').read_bytes()
 PREFIX = 60
 SUFFIX = 309
@@ -15,9 +15,9 @@ changed = data[changed_start:changed_end]
 contents_pat = 'Contents'.encode('utf-16le')
 content_off = data.find(contents_pat)
 
-print(f'changed region: 0x{changed_start:08x}-0x{changed_end:08x}')
-print('content area ("Contents") offset:', content_off, hex(content_off))
-print()
+f.write(f"changed region: 0x{changed_start:08x}-0x{changed_end:08x}\n")
+f.write(f"content area ('Contents') offset: {content_off}, {hex(content_off)}\n")
+f.write("\n")
 
 # collect small u32 values in changed region
 small_vals = []
@@ -35,24 +35,24 @@ for off, val in small_vals:
         filtered.append((off, val))
 
 for off, val in filtered:
-    print(f'Changed-region dword at 0x{off:08x} = {val} (0x{val:08x})')
+    f.write(f"Changed-region dword at 0x{off:08x} = {val} (0x{val:08x})\n")
     # if val looks like an absolute offset inside file, dump hex + try decode UTF-16LE
     if 0 <= val < len(data):
-        print('  -> absolute addr exists in file; hexdump 32 bytes:')
+        f.write("  -> absolute addr exists in file; hexdump 32 bytes:\n")
         chunk = data[val:val+32]
-        print('     ', chunk.hex())
+        f.write(f"     {chunk.hex()}\n")
         # try decode as utf-16le snippet
         try:
             s = chunk.decode('utf-16le', errors='ignore').split('\x00',1)[0]
-            print('     decodes to (utf-16le):', repr(s[:80]))
+            f.write(f"     decodes to (utf-16le): {repr(s[:80])}\n")
         except Exception:
             pass
         # also print relative to content area if content_off found
         if content_off != -1:
             rel = val - content_off
-            print('     relative to content_off:', rel, f'(0x{rel:x})')
+            f.write(f"     relative to content_off: {rel} 0x{rel:x}\n")
     else:
-        print('  -> value is not a valid absolute offset in file')
-    print()
+        f.write("  -> value is not a valid absolute offset in file\n")
+    f.write("\n")
 
-print('Done.')
+f.write("Done.\n")
