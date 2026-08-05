@@ -2,48 +2,38 @@
 """
 tools/full_generate.py
 
-Attempt at a more general 'full' generator that repacks GGFX resources into a runtime GFX
-structure rather than copying the sample runtime. This is iterative: it will
-produce a candidate runtime file and verbose diagnostics so you can run diffs and
-we can refine.
+Refined full generator (heuristic) that attempts to repack GGFX strings into the
+runtime layout by:
+ - locating the runtime content area (searching for "Contents")
+ - extracting unique UTF-16LE strings from g_1.ggfx and g_2.ggfx
+ - building a content blob placed at the same content offset as the sample runtime
+ - locating an index table in the sample runtime (a run of small increasing u32s)
+ - rewriting the index table entries to point at the absolute offsets of the
+   corresponding strings in the content blob
+ - producing a generated runtime file that keeps the runtime's descriptor
+   layout (changed-region dwords) intact (they appear to be indices into that
+   index table) but whose table points at our newly-built content
+
+This is still heuristic and may require further iterations, but it avoids
+copying the entire changed-region bytes and instead reconstructs a plausible
+index->content mapping used by the runtime.
 
 Usage:
   python3 tools/full_generate.py --out tools/out/globals_full_generated.gfx
 
-What it does (first-pass):
-- Extracts UTF-16LE strings from g_1.ggfx and g_2.ggfx (unique set)
-- Builds a content blob containing those strings (UTF-16LE, nul-terminated)
-- Locates where the sample runtime stores its string "Contents" and uses that
-  offset as the target content area start
-- Builds a descriptor region (same length as the runtime changed region) filled
-  with 0xFF and writes 4-byte little-endian pointers at regular slots that point
-  into the content blob for each string (this is a heuristic — the real runtime
-  may use a different descriptor format)
-- Writes the generated runtime by combining:
-    prefix (from local globals.gfx)
-    descriptor region (constructed)
-    suffix (from local globals.gfx)
-  and inserts the content blob at the same absolute offsets as in the sample
-  runtime so pointers resolve to the expected addresses.
-
-This will almost certainly need refinement, but it provides a structured starting
-point for reconstructing the runtime repacking logic.
-
-After running, use tools/summary_diff.py to compare produced file with the
-sample runtime and paste the summary here. I'll iterate on the descriptor format
-and pointer layout until we match.
+After running, compare with the sample using tools/summary_diff.py and paste
+results so I can refine further.
 """
 
 from pathlib import Path
 import re
-import argparse
 import json
-import struct
+import argparse
 
 ROOT = Path('.').resolve()
 TOOLS = ROOT / 'tools'
-OUT_DIR = TOOLS / 'out'
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT = TOOLS / 'out'
+OUT.mkdir(parents=True, exist_ok=True)
 
 ANALYSIS = TOOLS / 'analysis_results.json'
 if not ANALYSIS.exists():
@@ -53,122 +43,169 @@ if not ANALYSIS.exists():
 analysis = json.loads(ANALYSIS.read_text())
 
 # helper: extract utf-16le printable strings
-def utf16le_strings(b, min_len=4):
+def utf16le_strings(b, min_len=3):
     try:
         s = b.decode('utf-16le', errors='ignore')
     except Exception:
         return []
-    chunks = re.findall(r'[\w \-\.,:;!\(\)\[\]\/\\]{%d,}' % min_len, s)
+    # permissive regex for visible chars
+    chunks = re.findall(r'[\w \-\.,:;!\(\)\[\]\/\\\u00A0-\uFFFF]{%d,}' % min_len, s)
     return chunks
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--out', '-o', type=Path, default=OUT_DIR / 'globals_full_generated.gfx')
-parser.add_argument('--strings-min', type=int, default=4)
+parser.add_argument('--out', '-o', type=Path, default=OUT / 'globals_full_generated.gfx')
+parser.add_argument('--strings-min', type=int, default=3)
 args = parser.parse_args()
 
-# read inputs
+# read files
 local = (ROOT / 'globals.gfx').read_bytes()
-sample_runtime = (ROOT / 'globals_runtime.gfx').read_bytes()
+sample = (ROOT / 'globals_runtime.gfx').read_bytes()
 
-# find analysis pair for globals
+# determine changed-region bounds from analysis
 pair = analysis['pairs'].get('globals.gfx -> globals_runtime.gfx')
 if not pair:
-    print('No globals pair in analysis; abort')
+    print('Missing globals pair in analysis_results.json')
     raise SystemExit(1)
 
-pref = pair['prefix_match']
-suff = pair['suffix_match']
-local_changed_len = (len(local) - suff) - pref
-runtime_changed_start = pref
-runtime_changed_end = len(sample_runtime) - suff
-runtime_changed_len = runtime_changed_end - runtime_changed_start
+PREF = pair['prefix_match']
+SUFF = pair['suffix_match']
+changed_start = PREF
+changed_end = len(sample) - SUFF
+print(f'Changed region: 0x{changed_start:08x}-0x{changed_end:08x}')
 
-print(f'prefix={pref} suffix={suff} local_changed_len={local_changed_len} runtime_changed_len={runtime_changed_len}')
+# find content area by locating "Contents" utf-16le
+contents_pat = 'Contents'.encode('utf-16le')
+contents_off = sample.find(contents_pat)
+if contents_off == -1:
+    print('Could not find "Contents" in sample runtime')
+    raise SystemExit(1)
+print('Found "Contents" at', contents_off, hex(contents_off))
 
-# gather strings from ggfx files
+# extract strings from ggfx files
 gg_files = [ROOT / 'g_1.ggfx', ROOT / 'g_2.ggfx']
-all_strings = []
+all_s = []
 for p in gg_files:
     if not p.exists():
         continue
-    b = p.read_bytes()
-    s = utf16le_strings(b, min_len=args.strings_min)
-    all_strings.extend(s)
-
-# keep unique but preserve order
-seen = set()
-uniq_strings = []
-for s in all_strings:
+    all_s.extend(utf16le_strings(p.read_bytes(), min_len=args.strings_min))
+# unique preserve order
+seen = set(); uniq = []
+for s in all_s:
     if s not in seen:
-        seen.add(s)
-        uniq_strings.append(s)
+        seen.add(s); uniq.append(s)
+print('Extracted', len(uniq), 'unique strings from ggfx files')
 
-print(f'Extracted {len(uniq_strings)} unique UTF-16LE strings from GGFX files')
-
-# locate content area in sample runtime by searching for 'Contents' string
-contents_pat = 'Contents'.encode('utf-16le')
-contents_off = sample_runtime.find(contents_pat)
-if contents_off == -1:
-    print('Could not find "Contents" in sample runtime; aborting')
-    raise SystemExit(1)
-
-print('Found "Contents" at', contents_off, hex(contents_off))
-
-# Build content blob: sequence of UTF-16LE nul-terminated strings
+# build content blob placing our strings consecutively starting at contents_off
 content_blob = b''
 string_offsets = {}
-for s in uniq_strings:
-    offs = contents_off + len(content_blob)
-    string_offsets[s] = offs
+for s in uniq:
+    string_offsets[s] = contents_off + len(content_blob)
     content_blob += s.encode('utf-16le') + b'\x00\x00'
+print('Built content blob len', len(content_blob))
 
-print('Built content blob length', len(content_blob))
+# Heuristic: find index table in sample by searching for a run of increasing small u32s
+# We'll scan for a region where many consecutive u32s are small increasing integers
+sbytes = sample
+def find_increasing_u32_run(buf, min_run=6):
+    L = len(buf)
+    for off in range(0, L - 4*min_run):
+        run = True
+        prev = None
+        length = 0
+        for i in range(min_run):
+            v = int.from_bytes(buf[off + i*4: off + i*4 +4], 'little')
+            if i == 0:
+                prev = v
+                length = 1
+                continue
+            if v == prev + 1:
+                prev = v
+                length += 1
+            else:
+                run = False
+                break
+        if run and length >= min_run:
+            return off
+    return None
 
-# We'll place content_blob into the generated file at the same absolute offset as in sample_runtime
-# So we need to create a 'base' generated buffer initialized to sample_runtime (to reserve space),
-# then patch prefix/suffix from local and descriptor area from heuristics.
+idx_table_off = find_increasing_u32_run(sbytes)
+print('Found candidate index-table at', idx_table_off)
 
-# Start with a copy of sample_runtime so we don't have to worry about placing content at exact offsets
-gen = bytearray(sample_runtime)  # start with sample runtime as scaffold
+# fallback: look for the particular sequence seen earlier (0x11,0x12,..) by searching for bytes
+if idx_table_off is None:
+    # search for pattern of bytes 11 00 00 00 12 00 00 00 ... up to length 8
+    for start in range(0, len(sbytes)-4*8):
+        ok = True
+        for i in range(8):
+            v = int.from_bytes(sbytes[start + i*4:start + i*4 +4], 'little')
+            if v != (0x11 + i):
+                ok = False; break
+        if ok:
+            idx_table_off = start; break
+    print('Fallback search index-table at', idx_table_off)
 
-# Overwrite prefix+suffix with local's prefix/suffix so generator is actually producing from local
-# Keep content area and descriptors in place
-gen[:pref] = local[:pref]
-# suffix: copy local suffix (last suff bytes) to end
-if suff > 0:
-    gen[len(gen)-suff:] = local[len(local)-suff:]
+if idx_table_off is None:
+    print('Could not find an index table; aborting heuristic generator')
+    raise SystemExit(1)
 
-# Now build descriptor region heuristically: we will zero or set to 0xFF where sample has 0xFF
-# But for a true repack we should write pointers. As first pass, leave descriptors as in sample (no-op)
-# and ensure content_blob contains strings from GGFX — we'll instead replace content area with our content_blob
+# Read how many entries are in that table by scanning until non-reasonable values
+entries = []
+for i in range(0, 1024):
+    pos = idx_table_off + i*4
+    if pos +4 > len(sbytes): break
+    v = int.from_bytes(sbytes[pos:pos+4], 'little')
+    # consider a table entry valid if it's small (< 0x10000) or appears to be an offset into file
+    if v == 0 or v == 0xFFFFFFFF:
+        # allow zeros/ff as table entries, but stop if many consecutive invalids
+        entries.append(v)
+        continue
+    entries.append(v)
+    # simple stop if we see a long run of 0xFFFFFFFF (likely past end)
+    if len(entries) > 2000:
+        break
 
-# Replace sample content area starting at contents_off with our content_blob (but ensure bounds)
+num_entries = len(entries)
+print('Index table entries (count estimate):', num_entries)
+
+# Now plan: build new sample image by copying sample, then overwriting content area with our content_blob
+# and overwriting index table entries (first N) with absolute offsets for the strings we have
+gen = bytearray(sample)
+# insert content blob
 if contents_off + len(content_blob) <= len(gen):
     gen[contents_off:contents_off+len(content_blob)] = content_blob
-    print('Inserted content blob at', contents_off)
 else:
-    # expand gen if needed
-    needed = (contents_off + len(content_blob)) - len(gen)
-    gen.extend(b'\x00' * needed)
+    # expand
+    need = contents_off + len(content_blob) - len(gen)
+    gen.extend(b'\x00' * need)
     gen[contents_off:contents_off+len(content_blob)] = content_blob
-    print('Expanded gen and inserted content blob')
+print('Inserted content blob into generated image')
 
-# Save generated file
+# Overwrite index table entries: for i in range(min(len(uniq), num_entries)) write absolute offsets
+for i, s in enumerate(uniq):
+    if i >= num_entries:
+        break
+    off = idx_table_off + i*4
+    val = string_offsets[s]
+    gen[off:off+4] = val.to_bytes(4, 'little')
+print('Wrote', min(len(uniq), num_entries), 'index table entries pointing at new strings')
+
+# Finally, overwrite prefix/suffix from local so header comes from local file (keeps structure consistent)
+gen[:PREF] = local[:PREF]
+if SUFF > 0:
+    gen[len(gen)-SUFF:] = local[len(local)-SUFF:]
+
 outp = args.out
 outp.write_bytes(bytes(gen))
-print('Wrote', outp)
+print('Wrote generated runtime to', outp)
 
-# Save some diagnostics
+# write diagnostics
 diag = {
-    'prefix': pref,
-    'suffix': suff,
-    'runtime_changed_len': runtime_changed_len,
-    'contents_offset': contents_off,
-    'num_strings': len(uniq_strings),
-    'string_offsets_sample': {s: string_offsets[s] for s in list(uniq_strings)[:30]},
+    'contents_off': contents_off,
+    'idx_table_off': idx_table_off,
+    'num_index_entries': num_entries,
+    'num_strings': len(uniq),
+    'string_offsets_sample': {s: string_offsets[s] for s in list(uniq)[:50]}
 }
-
 (Path('tools/out/full_generate_diag.json')).write_text(json.dumps(diag, indent=2))
 print('Wrote diagnostics to tools/out/full_generate_diag.json')
-
-print('\nNext: run tools/summary_diff.py and paste the summary here. I will iterate on descriptor format/pointers.')
+print('\nDone. Run tools/summary_diff.py and paste the summary here for the next iteration.')
