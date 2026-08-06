@@ -9,7 +9,8 @@ runtime layout by:
  - building a content blob placed at the same content offset as the sample runtime
  - locating an index table in the sample runtime (a run of small increasing u32s)
  - rewriting the index table entries to point at the absolute offsets of the
-   corresponding strings in the content blob
+   corresponding strings in the content blob (or to sequential index values
+   matching the sample's index table layout when appropriate)
  - producing a generated runtime file that keeps the runtime's descriptor
    layout (changed-region dwords) intact (they appear to be indices into that
    index table) but whose table points at our newly-built content
@@ -150,15 +151,10 @@ if idx_table_off is None:
 
 # Read how many entries are in that table by scanning until non-reasonable values
 entries = []
-for i in range(0, 1024):
+for i in range(0, 4096):
     pos = idx_table_off + i*4
     if pos +4 > len(sbytes): break
     v = int.from_bytes(sbytes[pos:pos+4], 'little')
-    # consider a table entry valid if it's small (< 0x10000) or appears to be an offset into file
-    if v == 0 or v == 0xFFFFFFFF:
-        # allow zeros/ff as table entries, but stop if many consecutive invalids
-        entries.append(v)
-        continue
     entries.append(v)
     # simple stop if we see a long run of 0xFFFFFFFF (likely past end)
     if len(entries) > 2000:
@@ -167,8 +163,14 @@ for i in range(0, 1024):
 num_entries = len(entries)
 print('Index table entries (count estimate):', num_entries)
 
+# Decide index-table write mode: sample's entries are small increasing ints -> preserve sequential indices
+# detect sample base index
+sample_first = int.from_bytes(sbytes[idx_table_off:idx_table_off+4],'little')
+print('Sample index table first value:', sample_first)
+
 # Now plan: build new sample image by copying sample, then overwriting content area with our content_blob
-# and overwriting index table entries (first N) with absolute offsets for the strings we have
+# and overwriting index table entries (first N) with either absolute offsets or sequential indices to match sample
+
 gen = bytearray(sample)
 # insert content blob
 if contents_off + len(content_blob) <= len(gen):
@@ -180,14 +182,25 @@ else:
     gen[contents_off:contents_off+len(content_blob)] = content_blob
 print('Inserted content blob into generated image')
 
-# Overwrite index table entries: for i in range(min(len(uniq), num_entries)) write absolute offsets
-for i, s in enumerate(uniq):
-    if i >= num_entries:
-        break
-    off = idx_table_off + i*4
-    val = string_offsets[s]
-    gen[off:off+4] = val.to_bytes(4, 'little')
-print('Wrote', min(len(uniq), num_entries), 'index table entries pointing at new strings')
+# If sample's index table contains small increasing ints, write sequential indices starting at sample_first
+if sample_first is not None and 0 <= sample_first < 0x100000:
+    base = sample_first
+    for i, s in enumerate(uniq):
+        if i >= num_entries:
+            break
+        off = idx_table_off + i*4
+        val = base + i
+        gen[off:off+4] = val.to_bytes(4, 'little')
+    print('Wrote', min(len(uniq), num_entries), 'sequential index entries starting at', base)
+else:
+    # fallback: write absolute offsets for strings
+    for i, s in enumerate(uniq):
+        if i >= num_entries:
+            break
+        off = idx_table_off + i*4
+        val = string_offsets[s]
+        gen[off:off+4] = val.to_bytes(4, 'little')
+    print('Wrote', min(len(uniq), num_entries), 'absolute offsets into index table (fallback)')
 
 # Finally, overwrite prefix/suffix from local so header comes from local file (keeps structure consistent)
 gen[:PREF] = local[:PREF]
@@ -204,6 +217,7 @@ diag = {
     'idx_table_off': idx_table_off,
     'num_index_entries': num_entries,
     'num_strings': len(uniq),
+    'sample_first_index': sample_first,
     'string_offsets_sample': {s: string_offsets[s] for s in list(uniq)[:50]}
 }
 (Path('tools/out/full_generate_diag.json')).write_text(json.dumps(diag, indent=2))
