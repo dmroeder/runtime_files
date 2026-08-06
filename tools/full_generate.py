@@ -4,25 +4,19 @@ tools/full_generate.py
 
 Heuristic full generator that repacks GGFX strings into the runtime layout.
 
-This revision improves mapping-block patching by building a mapping of decoded
-sample content strings (normalized) to their offsets and using fuzzy matching
-when patching map entries so we can handle small encoding/format differences.
-
-Changes in this commit:
- - copy the sample file's prefix bytes into the generated image (fixes header
-   differences like the dword at 0x3C)
- - improve string normalization to use NFKD and strip combining marks before
-   fuzzy matching
- - write the generated image to both the path the CLI default used earlier
-   (tools/out/globals_full_generated.gfx) and a convenience path
-   (tools/out/globals_generated_runtime.gfx) because earlier diffs compared
-   the latter filename.
+This revision implements a best-match fallback using difflib.SequenceMatcher
+for mapping-block entries that could not be patched by exact or substring
+matching. For each skipped sample mapping entry, we pick the generated
+string with the highest similarity score and patch the mapping entry if the
+score exceeds a sanity threshold.
 
 Usage:
   python3 tools/full_generate.py --out tools/out/globals_full_generated.gfx
 
-After running: compare with sample using tools/summary_diff.py and paste the
-results so I can refine further.
+Output:
+ - tools/out/globals_full_generated.gfx
+ - tools/out/globals_generated_runtime.gfx (convenience)
+ - tools/out/full_generate_diag.json (diagnostics with patched/skipped info)
 """
 
 from pathlib import Path
@@ -30,6 +24,7 @@ import re
 import json
 import argparse
 import unicodedata
+import difflib
 
 ROOT = Path('.').resolve()
 TOOLS = ROOT / 'tools'
@@ -67,6 +62,8 @@ def normalize(s):
 parser = argparse.ArgumentParser()
 parser.add_argument('--out', '-o', type=Path, default=OUT / 'globals_full_generated.gfx')
 parser.add_argument('--strings-min', type=int, default=3)
+parser.add_argument('--match-threshold', type=float, default=0.60,
+                    help='Minimum similarity score (0-1) for best-match fallback')
 args = parser.parse_args()
 
 # read files
@@ -203,8 +200,8 @@ for s, off in string_offsets.items():
         gen_norm_to_off[n] = off
 
 # Read mapping entries in sample and patch offsets in gen using normalized matching
-patched = 0
-skipped = 0
+patched = []
+skipped_positions = []
 for pos in range(mapping_start, mapping_end, 4):
     v = int.from_bytes(sbytes[pos:pos+4], 'little')
     if not (contents_off <= v < file_len):
@@ -218,30 +215,45 @@ for pos in range(mapping_start, mapping_end, 4):
     try:
         s = sbytes[v:end].decode('utf-16le', errors='ignore')
     except Exception:
-        skipped += 1
+        skipped_positions.append({'pos': pos, 'reason': 'decode_fail', 'sample_val': v})
         continue
     n = normalize(s)
     if not n:
-        skipped += 1
+        skipped_positions.append({'pos': pos, 'reason': 'normalize_empty', 'sample_val': v, 'sample_str': s})
         continue
     # exact match
     if n in gen_norm_to_off:
         new_off = gen_norm_to_off[n]
         gen[pos:pos+4] = new_off.to_bytes(4, 'little')
-        patched += 1
+        patched.append({'pos': pos, 'old': v, 'new': new_off, 'sample_str': s, 'matched': n, 'method': 'exact'})
         continue
     # substring match: find any gen key that contains n or is contained in n
     found = False
     for gn, goff in gen_norm_to_off.items():
         if n in gn or gn in n:
             gen[pos:pos+4] = goff.to_bytes(4, 'little')
-            patched += 1
+            patched.append({'pos': pos, 'old': v, 'new': goff, 'sample_str': s, 'matched': gn, 'method': 'substr'})
             found = True
             break
-    if not found:
-        skipped += 1
+    if found:
+        continue
+    # fallback: best difflib match
+    best_score = 0.0
+    best_gn = None
+    best_goff = None
+    for gn, goff in gen_norm_to_off.items():
+        score = difflib.SequenceMatcher(None, n, gn).ratio()
+        if score > best_score:
+            best_score = score
+            best_gn = gn
+            best_goff = goff
+    if best_score >= args.match_threshold and best_goff is not None:
+        gen[pos:pos+4] = best_goff.to_bytes(4, 'little')
+        patched.append({'pos': pos, 'old': v, 'new': best_goff, 'sample_str': s, 'matched': best_gn, 'method': 'best', 'score': best_score})
+    else:
+        skipped_positions.append({'pos': pos, 'reason': 'no_match', 'sample_val': v, 'sample_str': s, 'best_score': best_score, 'best_match': best_gn})
 
-print('Patched', patched, 'mapping entries; skipped', skipped)
+print('Patched entries:', len(patched), 'Skipped entries:', len(skipped_positions))
 
 # Also write sequential index table entries if sample had sequential small indices
 idx_table_off = None
@@ -279,6 +291,10 @@ if SUFF > 0:
     gen[len(gen)-SUFF:] = sample[len(sample)-SUFF:]
 
 outp = args.out
+# For updates to an existing file, we need the blob sha; fetch it from the repo
+# to satisfy the create_or_update_file guidance in the tool instructions.
+# However, this script is intended to run locally; writing out to disk suffices.
+
 outp.write_bytes(bytes(gen))
 # Also write convenience filename used in earlier diffs
 alternate = OUT / 'globals_generated_runtime.gfx'
@@ -286,15 +302,19 @@ alternate.write_bytes(bytes(gen))
 print('Wrote generated runtime to', outp, 'and', alternate)
 
 # write diagnostics
-(Path('tools/out/full_generate_diag.json')).write_text(json.dumps({
+diag = {
     'contents_off': contents_off,
     'mapping_start': mapping_start,
     'mapping_end': mapping_end,
     'mapping_len': mapping_end-mapping_start,
+    'patched_count': len(patched),
+    'skipped_count': len(skipped_positions),
     'patched_entries': patched,
-    'skipped_entries': skipped,
+    'skipped_entries': skipped_positions,
     'num_strings': len(uniq),
-    'idx_table_off': idx_table_off
-}, indent=2))
+    'idx_table_off': idx_table_off,
+    'match_threshold': args.match_threshold
+}
+(Path('tools/out/full_generate_diag.json')).write_text(json.dumps(diag, indent=2))
 print('Wrote diagnostics to tools/out/full_generate_diag.json')
 print('\nDone. Run tools/summary_diff.py and paste the summary here for the next iteration.')
