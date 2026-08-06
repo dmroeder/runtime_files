@@ -4,24 +4,9 @@ tools/full_generate.py
 
 Heuristic full generator that repacks GGFX strings into the runtime layout.
 
-This revision implements a copy-and-patch strategy for the runtime's
-index->offset mapping block:
- - Locate the runtime content area by searching for the UTF-16LE "Contents" string.
- - Extract unique UTF-16LE strings from g_1.ggfx and g_2.ggfx and build a
-   content blob placed at the same content offset the sample runtime uses.
- - Heuristically locate the runtime's index->offset mapping block by scanning
-   a region of the sample file for many u32 words that look like pointers into
-   the content area.
- - Copy the sample mapping block bytes into the generated image and then
-   patch any u32 values that point at strings in the sample content area so
-   they point at the corresponding offsets in the generated content.
- - Preserve the sample's small index table (we write sequential indices there)
-   so descriptors -> small index -> mapping block -> content offsets will
-   resolve to our generated strings.
-
-This is iterative and conservative: by copying the sample mapping block
-layout and only updating offsets we avoid incorrectly reconstructing
-metadata fields whose meaning we haven't fully reversed.
+This revision improves mapping-block patching by building a mapping of decoded
+sample content strings (normalized) to their offsets and using fuzzy matching
+when patching map entries so we can handle small encoding/format differences.
 
 Usage:
   python3 tools/full_generate.py --out tools/out/globals_full_generated.gfx
@@ -55,6 +40,15 @@ def utf16le_strings(b, min_len=3):
         return []
     chunks = re.findall(r'[\w \-\.,:;!\(\)\[\]\/\\\u00A0-\uFFFF]{%d,}' % min_len, s)
     return chunks
+
+# normalize string for fuzzy matching
+def normalize(s):
+    # remove BOMs and control chars, strip, and lower
+    if not s:
+        return ''
+    s = s.replace('\ufeff','')
+    s = ''.join(ch for ch in s if (ch.isprintable()))
+    return s.strip().lower()
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--out', '-o', type=Path, default=OUT / 'globals_full_generated.gfx')
@@ -114,7 +108,6 @@ for s in uniq:
 print('Built content blob len', len(content_blob))
 
 # Heuristic: locate mapping block (index->offset table) by scanning a candidate range
-# Use a heuristic scan over 0x0400 .. 0x2000 to find the window with many u32s inside content range
 sbytes = sample
 file_len = len(sbytes)
 search_lo = 0x0400
@@ -136,7 +129,6 @@ for start in range(search_lo, search_hi - window_u32s*4, 4):
 
 print('Mapping-block scan best start:', best, 'score:', best_score)
 if best is None or best_score < 4:
-    # fallback to earlier-known candidate area around 0x0c80 if present
     fallback = 0x0c80
     if fallback + 4 <= file_len:
         print('Falling back to', hex(fallback))
@@ -145,7 +137,6 @@ if best is None or best_score < 4:
         print('Could not locate mapping block; aborting')
         raise SystemExit(1)
 
-# Narrow the mapping block by trimming trailing 0xFFFFFFFF runs and include region with many in-range values
 mapping_start = best
 mapping_end = mapping_start + window_u32s*4
 # trim leading/ trailing 0xFF sequences
@@ -156,9 +147,33 @@ while mapping_end > mapping_start and all(b == 0xFF for b in sbytes[mapping_end-
 
 print('Mapping block candidate:', hex(mapping_start), hex(mapping_end), '(%d bytes)' % (mapping_end-mapping_start))
 
+# Build a map of decoded sample content strings -> offset (normalized)
+sample_strings = {}
+p = contents_off
+while p + 2 < file_len:
+    # find next terminator
+    end = p
+    # allow up to 4096 bytes per string to avoid runaway
+    while end + 1 < min(file_len, p + 4096):
+        if sbytes[end:end+2] == b'\x00\x00':
+            break
+        end += 2
+    if end >= file_len or end == p:
+        break
+    try:
+        s = sbytes[p:end].decode('utf-16le', errors='ignore')
+    except Exception:
+        break
+    if len(s) >= 1:
+        n = normalize(s)
+        if n:
+            sample_strings[n] = p
+    p = end + 2
+
+print('Sample content decoded strings:', len(sample_strings))
+
 # Build generated image starting from sample (so we preserve layout/metadata) and patch
 gen = bytearray(sample)
-
 # insert content blob
 if contents_off + len(content_blob) <= len(gen):
     gen[contents_off:contents_off+len(content_blob)] = content_blob
@@ -168,38 +183,57 @@ else:
     gen[contents_off:contents_off+len(content_blob)] = content_blob
 print('Inserted content blob into generated image')
 
-# Read mapping entries in sample and patch offsets in gen
+# Also build normalized map for our generated strings
+gen_norm_to_off = {}
+for s, off in string_offsets.items():
+    n = normalize(s)
+    if n:
+        gen_norm_to_off[n] = off
+
+# Read mapping entries in sample and patch offsets in gen using normalized matching
 patched = 0
+skipped = 0
 for pos in range(mapping_start, mapping_end, 4):
     v = int.from_bytes(sbytes[pos:pos+4], 'little')
-    # Only attempt to patch values that point into the sample's content area
     if not (contents_off <= v < file_len):
         continue
-    # decode string at v in sample
-    # read until UTF-16LE terminator
+    # try to decode at v in sample
     end = v
-    while end + 1 < file_len:
+    while end + 1 < file_len and end < v + 4096:
         if sbytes[end:end+2] == b'\x00\x00':
             break
         end += 2
     try:
-        s = sbytes[v:end].decode('utf-16le')
+        s = sbytes[v:end].decode('utf-16le', errors='ignore')
     except Exception:
+        skipped += 1
         continue
-    if s not in string_offsets:
-        # not one of our strings; skip
+    n = normalize(s)
+    if not n:
+        skipped += 1
         continue
-    new_off = string_offsets[s]
-    gen[pos:pos+4] = new_off.to_bytes(4, 'little')
-    patched += 1
+    # exact match
+    if n in gen_norm_to_off:
+        new_off = gen_norm_to_off[n]
+        gen[pos:pos+4] = new_off.to_bytes(4, 'little')
+        patched += 1
+        continue
+    # substring match: find any gen key that contains n or is contained in n
+    found = False
+    for gn, goff in gen_norm_to_off.items():
+        if n in gn or gn in n:
+            gen[pos:pos+4] = goff.to_bytes(4, 'little')
+            patched += 1
+            found = True
+            break
+    if not found:
+        skipped += 1
 
-print('Patched', patched, 'mapping entries in block')
+print('Patched', patched, 'mapping entries; skipped', skipped)
 
 # Also write sequential index table entries if sample had sequential small indices
 idx_table_off = None
-# attempt to find small-index table (like 6,7,8...) by scanning near changed region
 for start in range(PREF, PREF + 0x400, 4):
-    # check if we see an increasing run of small integers
     ok = True
     first = int.from_bytes(sbytes[start:start+4], 'little')
     if not (0 < first < 0x1000):
@@ -213,7 +247,6 @@ for start in range(PREF, PREF + 0x400, 4):
         break
 
 if idx_table_off is None:
-    # fallback to known 0xA14
     idx_table_off = 0xA14 if 0xA14 + 4 <= len(gen) else None
 
 if idx_table_off:
@@ -238,13 +271,13 @@ outp.write_bytes(bytes(gen))
 print('Wrote generated runtime to', outp)
 
 # write diagnostics
-sample_mapping = sbytes[mapping_start:mapping_end]
 (Path('tools/out/full_generate_diag.json')).write_text(json.dumps({
     'contents_off': contents_off,
     'mapping_start': mapping_start,
     'mapping_end': mapping_end,
     'mapping_len': mapping_end-mapping_start,
     'patched_entries': patched,
+    'skipped_entries': skipped,
     'num_strings': len(uniq),
     'idx_table_off': idx_table_off
 }, indent=2))
