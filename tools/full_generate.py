@@ -4,11 +4,11 @@ tools/full_generate.py
 
 Heuristic full generator that repacks GGFX strings into the runtime layout.
 
-This revision implements a best-match fallback using difflib.SequenceMatcher
-for mapping-block entries that could not be patched by exact or substring
-matching. For each skipped sample mapping entry, we pick the generated
-string with the highest similarity score and patch the mapping entry if the
-score exceeds a sanity threshold.
+This revision implements a deterministic mapping write: instead of relying
+on fuzzy matching to repair individual mapping entries, we now write the
+mapping-block sequentially so each index maps directly to the generated
+string offset we placed into the content area. Unused mapping slots are
+filled with 0xFFFFFFFF to avoid accidental valid pointers.
 
 Usage:
   python3 tools/full_generate.py --out tools/out/globals_full_generated.gfx
@@ -63,7 +63,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--out', '-o', type=Path, default=OUT / 'globals_full_generated.gfx')
 parser.add_argument('--strings-min', type=int, default=3)
 parser.add_argument('--match-threshold', type=float, default=0.60,
-                    help='Minimum similarity score (0-1) for best-match fallback')
+                    help='Minimum similarity score (0-1) for best-match fallback — not used in deterministic mode')
+parser.add_argument('--deterministic', action='store_true', default=True,
+                    help='Write deterministic mapping table (default: True)')
 args = parser.parse_args()
 
 # read files
@@ -199,72 +201,36 @@ for s, off in string_offsets.items():
     if n:
         gen_norm_to_off[n] = off
 
-# Read mapping entries in sample and patch offsets in gen using normalized matching
 patched = []
 skipped_positions = []
-for pos in range(mapping_start, mapping_end, 4):
-    v = int.from_bytes(sbytes[pos:pos+4], 'little')
-    if not (contents_off <= v < file_len):
-        continue
-    # try to decode at v in sample
-    end = v
-    while end + 1 < file_len and end < v + 4096:
-        if sbytes[end:end+2] == b'\x00\x00':
-            break
-        end += 2
-    try:
-        s = sbytes[v:end].decode('utf-16le', errors='ignore')
-    except Exception:
-        skipped_positions.append({'pos': pos, 'reason': 'decode_fail', 'sample_val': v})
-        continue
-    n = normalize(s)
-    if not n:
-        skipped_positions.append({'pos': pos, 'reason': 'normalize_empty', 'sample_val': v, 'sample_str': s})
-        continue
-    # exact match
-    if n in gen_norm_to_off:
-        new_off = gen_norm_to_off[n]
-        gen[pos:pos+4] = new_off.to_bytes(4, 'little')
-        patched.append({'pos': pos, 'old': v, 'new': new_off, 'sample_str': s, 'matched': n, 'method': 'exact'})
-        continue
-    # substring match: find any gen key that contains n or is contained in n
-    found = False
-    for gn, goff in gen_norm_to_off.items():
-        if n in gn or gn in n:
-            gen[pos:pos+4] = goff.to_bytes(4, 'little')
-            patched.append({'pos': pos, 'old': v, 'new': goff, 'sample_str': s, 'matched': gn, 'method': 'substr'})
-            found = True
-            break
-    if found:
-        continue
-    # fallback: best difflib match
-    best_score = 0.0
-    best_gn = None
-    best_goff = None
-    for gn, goff in gen_norm_to_off.items():
-        score = difflib.SequenceMatcher(None, n, gn).ratio()
-        if score > best_score:
-            best_score = score
-            best_gn = gn
-            best_goff = goff
-    if best_score >= args.match_threshold and best_goff is not None:
-        gen[pos:pos+4] = best_goff.to_bytes(4, 'little')
-        patched.append({'pos': pos, 'old': v, 'new': best_goff, 'sample_str': s, 'matched': best_gn, 'method': 'best', 'score': best_score})
-    else:
-        skipped_positions.append({'pos': pos, 'reason': 'no_match', 'sample_val': v, 'sample_str': s, 'best_score': best_score, 'best_match': best_gn})
 
-print('Patched entries:', len(patched), 'Skipped entries:', len(skipped_positions))
+# Deterministic mapping: write mapping entries sequentially so index i -> offset of uniq[i]
+num_slots = (mapping_end - mapping_start) // 4
+print('Mapping slots:', num_slots, 'strings:', len(uniq))
+for i in range(num_slots):
+    pos = mapping_start + i*4
+    if i < len(uniq):
+        off = string_offsets[uniq[i]]
+        gen[pos:pos+4] = off.to_bytes(4, 'little')
+        patched.append({'pos': pos, 'old': int.from_bytes(sbytes[pos:pos+4], 'little'), 'new': off, 'string': uniq[i], 'method': 'deterministic'})
+    else:
+        # mark unused slots with 0xFFFFFFFF to avoid pointing into content accidentally
+        gen[pos:pos+4] = (0xFFFFFFFF).to_bytes(4, 'little')
+
+print('Deterministic mapping written; patched slots:', len(patched))
 
 # Also write sequential index table entries if sample had sequential small indices
 idx_table_off = None
 for start in range(PREF, PREF + 0x400, 4):
     ok = True
+    if start + 32 >= len(sbytes):
+        break
     first = int.from_bytes(sbytes[start:start+4], 'little')
     if not (0 < first < 0x1000):
         continue
-    for i in range(1, 8):
-        v = int.from_bytes(sbytes[start + i*4:start + i*4 +4], 'little')
-        if v != first + i:
+    for j in range(1, 8):
+        v = int.from_bytes(sbytes[start + j*4:start + j*4 +4], 'little')
+        if v != first + j:
             ok = False; break
     if ok:
         idx_table_off = start
@@ -291,10 +257,6 @@ if SUFF > 0:
     gen[len(gen)-SUFF:] = sample[len(sample)-SUFF:]
 
 outp = args.out
-# For updates to an existing file, we need the blob sha; fetch it from the repo
-# to satisfy the create_or_update_file guidance in the tool instructions.
-# However, this script is intended to run locally; writing out to disk suffices.
-
 outp.write_bytes(bytes(gen))
 # Also write convenience filename used in earlier diffs
 alternate = OUT / 'globals_generated_runtime.gfx'
@@ -313,7 +275,7 @@ diag = {
     'skipped_entries': skipped_positions,
     'num_strings': len(uniq),
     'idx_table_off': idx_table_off,
-    'match_threshold': args.match_threshold
+    'deterministic': True
 }
 (Path('tools/out/full_generate_diag.json')).write_text(json.dumps(diag, indent=2))
 print('Wrote diagnostics to tools/out/full_generate_diag.json')
