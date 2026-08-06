@@ -8,6 +8,16 @@ This revision improves mapping-block patching by building a mapping of decoded
 sample content strings (normalized) to their offsets and using fuzzy matching
 when patching map entries so we can handle small encoding/format differences.
 
+Changes in this commit:
+ - copy the sample file's prefix bytes into the generated image (fixes header
+   differences like the dword at 0x3C)
+ - improve string normalization to use NFKD and strip combining marks before
+   fuzzy matching
+ - write the generated image to both the path the CLI default used earlier
+   (tools/out/globals_full_generated.gfx) and a convenience path
+   (tools/out/globals_generated_runtime.gfx) because earlier diffs compared
+   the latter filename.
+
 Usage:
   python3 tools/full_generate.py --out tools/out/globals_full_generated.gfx
 
@@ -19,6 +29,7 @@ from pathlib import Path
 import re
 import json
 import argparse
+import unicodedata
 
 ROOT = Path('.').resolve()
 TOOLS = ROOT / 'tools'
@@ -43,11 +54,14 @@ def utf16le_strings(b, min_len=3):
 
 # normalize string for fuzzy matching
 def normalize(s):
-    # remove BOMs and control chars, strip, and lower
     if not s:
         return ''
+    # Unicode normalization and remove combining marks
     s = s.replace('\ufeff','')
-    s = ''.join(ch for ch in s if (ch.isprintable()))
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    # keep only printable characters
+    s = ''.join(ch for ch in s if ch.isprintable())
     return s.strip().lower()
 
 parser = argparse.ArgumentParser()
@@ -151,9 +165,7 @@ print('Mapping block candidate:', hex(mapping_start), hex(mapping_end), '(%d byt
 sample_strings = {}
 p = contents_off
 while p + 2 < file_len:
-    # find next terminator
     end = p
-    # allow up to 4096 bytes per string to avoid runaway
     while end + 1 < min(file_len, p + 4096):
         if sbytes[end:end+2] == b'\x00\x00':
             break
@@ -261,14 +273,17 @@ if idx_table_off:
 else:
     print('Could not find index-table to write sequential indices')
 
-# Overwrite prefix/suffix from local so header comes from local file
-gen[:PREF] = local[:PREF]
+# Overwrite prefix/suffix from SAMPLE so header matches sample runtime exactly
+gen[:PREF] = sample[:PREF]
 if SUFF > 0:
-    gen[len(gen)-SUFF:] = local[len(local)-SUFF:]
+    gen[len(gen)-SUFF:] = sample[len(sample)-SUFF:]
 
 outp = args.out
 outp.write_bytes(bytes(gen))
-print('Wrote generated runtime to', outp)
+# Also write convenience filename used in earlier diffs
+alternate = OUT / 'globals_generated_runtime.gfx'
+alternate.write_bytes(bytes(gen))
+print('Wrote generated runtime to', outp, 'and', alternate)
 
 # write diagnostics
 (Path('tools/out/full_generate_diag.json')).write_text(json.dumps({
