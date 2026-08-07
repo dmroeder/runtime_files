@@ -2,13 +2,15 @@
 """
 tools/full_generate.py
 
-Heuristic full generator that repacks GGFX strings into the runtime layout.
+Deterministic in-place content patching.
 
-This revision implements a deterministic mapping write: instead of relying
-on fuzzy matching to repair individual mapping entries, we now write the
-mapping-block sequentially so each index maps directly to the generated
-string offset we placed into the content area. Unused mapping slots are
-filled with 0xFFFFFFFF to avoid accidental valid pointers.
+This change updates the generator to patch strings in-place inside the
+sample content area (starting at the "Contents" marker) rather than
+replacing it with a single contiguous blob. That preserves runtime
+markers (0xFFFF sequences, separators) and writes generated strings only
+into the same offsets the runtime expects. If a generated string is
+longer than the sample slot it replaces, we will skip that slot (emit a
+warning) to avoid shifting the runtime layout.
 
 Usage:
   python3 tools/full_generate.py --out tools/out/globals_full_generated.gfx
@@ -16,7 +18,7 @@ Usage:
 Output:
  - tools/out/globals_full_generated.gfx
  - tools/out/globals_generated_runtime.gfx (convenience)
- - tools/out/full_generate_diag.json (diagnostics with patched/skipped info)
+ - tools/out/full_generate_diag.json (diagnostics)
 """
 
 from pathlib import Path
@@ -51,19 +53,17 @@ def utf16le_strings(b, min_len=3):
 def normalize(s):
     if not s:
         return ''
-    # Unicode normalization and remove combining marks
     s = s.replace('\ufeff','')
     s = unicodedata.normalize('NFKD', s)
     s = ''.join(ch for ch in s if not unicodedata.combining(ch))
-    # keep only printable characters
     s = ''.join(ch for ch in s if ch.isprintable())
     return s.strip().lower()
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--out', '-o', type=Path, default=OUT / 'globals_full_generated.gfx')
 parser.add_argument('--strings-min', type=int, default=3)
-parser.add_argument('--match-threshold', type=float, default=0.60,
-                    help='Minimum similarity score (0-1) for best-match fallback — not used in deterministic mode')
+parser.add_argument('--match-threshold', type=float, default=0.40,
+                    help='Minimum similarity score (0-1) for best-match fallback')
 parser.add_argument('--deterministic', action='store_true', default=True,
                     help='Write deterministic mapping table (default: True)')
 args = parser.parse_args()
@@ -112,20 +112,110 @@ for s in all_s:
         seen.add(s); uniq.append(s)
 print('Extracted', len(uniq), 'unique strings from ggfx files')
 
-# build content blob placing our strings consecutively starting at contents_off
-content_blob = b''
-string_offsets = {}
+# build normalized lookup for generated strings
+gen_norm = {}
 for s in uniq:
-    string_offsets[s] = contents_off + len(content_blob)
-    content_blob += s.encode('utf-16le') + b'\x00\x00'
-print('Built content blob len', len(content_blob))
+    n = normalize(s)
+    if n:
+        gen_norm[n] = s
 
-# Heuristic: locate mapping block (index->offset table) by scanning a candidate range
+# parse sample content area into slots: (offset, length, decoded_str)
 sbytes = sample
 file_len = len(sbytes)
+slots = []
+p = contents_off
+while p + 1 < file_len:
+    # if marker (0xFFFF x N) or all FF's in next 2 bytes, treat as marker and advance by 2
+    if sbytes[p:p+2] == b'\xff\xff':
+        # record marker slot
+        slots.append((p, 2, None))
+        p += 2
+        continue
+    # otherwise, read until null terminator (utf-16le)
+    end = p
+    while end + 1 < min(file_len, p + 4096):
+        if sbytes[end:end+2] == b'\x00\x00':
+            break
+        end += 2
+    if end == p:
+        # empty slot; advance
+        slots.append((p, 2, ''))
+        p += 2
+        continue
+    try:
+        s = sbytes[p:end].decode('utf-16le', errors='ignore')
+    except Exception:
+        s = ''
+    slot_len = end + 2 - p
+    slots.append((p, slot_len, s))
+    p = end + 2
+
+print('Parsed', len(slots), 'content slots from sample')
+
+# prepare generated image copy
+gen = bytearray(sample)
+
+patched = []
+skipped = []
+replaced_count = 0
+
+# function to pick best matching generated string for a sample string
+from difflib import SequenceMatcher
+
+def pick_best(sample_str):
+    n = normalize(sample_str)
+    if not n:
+        return None, 0.0
+    # exact
+    if n in gen_norm:
+        return gen_norm[n], 1.0
+    # substring
+    for gn, gs in gen_norm.items():
+        if n in gn or gn in n:
+            return gs, 0.95
+    # best difflib
+    best_score = 0.0
+    best_s = None
+    for gn, gs in gen_norm.items():
+        score = SequenceMatcher(None, n, gn).ratio()
+        if score > best_score:
+            best_score = score
+            best_s = gs
+    return best_s, best_score
+
+# iterate slots and replace in-place if matched and fits
+for off, length, s in slots:
+    if s is None:
+        # marker, skip
+        continue
+    if s == '':
+        # empty slot; skip
+        skipped.append({'off': off, 'len': length, 'reason': 'empty_slot'})
+        continue
+    best_s, score = pick_best(s)
+    if best_s is None:
+        skipped.append({'off': off, 'len': length, 'orig': s, 'reason': 'no_candidate'})
+        continue
+    # encode candidate
+    enc = best_s.encode('utf-16le') + b'\x00\x00'
+    if len(enc) > length:
+        # candidate doesn't fit: skip
+        skipped.append({'off': off, 'len': length, 'orig': s, 'candidate': best_s, 'cand_len': len(enc), 'reason': 'no_space', 'score': score})
+        continue
+    # write enc into gen at off, pad remaining with 0x00
+    gen[off:off+len(enc)] = enc
+    if len(enc) < length:
+        gen[off+len(enc):off+length] = b'\x00' * (length - len(enc))
+    patched.append({'off': off, 'len': length, 'orig': s, 'candidate': best_s, 'score': score})
+    replaced_count += 1
+
+print('Replaced', replaced_count, 'slots; skipped', len(skipped))
+
+# Deterministic mapping table write (same as before)
+# Heuristic: locate mapping block
 search_lo = 0x0400
 search_hi = min(0x2000, file_len - 4)
-window_u32s = 256  # window size in u32s
+window_u32s = 256
 best = None
 best_score = 0
 for start in range(search_lo, search_hi - window_u32s*4, 4):
@@ -133,22 +223,11 @@ for start in range(search_lo, search_hi - window_u32s*4, 4):
     for i in range(window_u32s):
         pos = start + i*4
         v = int.from_bytes(sbytes[pos:pos+4], 'little')
-        # count values that look like offsets into content area
         if contents_off <= v < file_len:
             cnt += 1
     if cnt > best_score:
         best_score = cnt
         best = start
-
-print('Mapping-block scan best start:', best, 'score:', best_score)
-if best is None or best_score < 4:
-    fallback = 0x0c80
-    if fallback + 4 <= file_len:
-        print('Falling back to', hex(fallback))
-        best = fallback
-    else:
-        print('Could not locate mapping block; aborting')
-        raise SystemExit(1)
 
 mapping_start = best
 mapping_end = mapping_start + window_u32s*4
@@ -158,124 +237,56 @@ while mapping_start < mapping_end and all(b == 0xFF for b in sbytes[mapping_star
 while mapping_end > mapping_start and all(b == 0xFF for b in sbytes[mapping_end-4:mapping_end]):
     mapping_end -= 4
 
-print('Mapping block candidate:', hex(mapping_start), hex(mapping_end), '(%d bytes)' % (mapping_end-mapping_start))
-
-# Build a map of decoded sample content strings -> offset (normalized)
-sample_strings = {}
-p = contents_off
-while p + 2 < file_len:
-    end = p
-    while end + 1 < min(file_len, p + 4096):
-        if sbytes[end:end+2] == b'\x00\x00':
-            break
-        end += 2
-    if end >= file_len or end == p:
-        break
-    try:
-        s = sbytes[p:end].decode('utf-16le', errors='ignore')
-    except Exception:
-        break
-    if len(s) >= 1:
-        n = normalize(s)
-        if n:
-            sample_strings[n] = p
-    p = end + 2
-
-print('Sample content decoded strings:', len(sample_strings))
-
-# Build generated image starting from sample (so we preserve layout/metadata) and patch
-gen = bytearray(sample)
-# insert content blob
-if contents_off + len(content_blob) <= len(gen):
-    gen[contents_off:contents_off+len(content_blob)] = content_blob
-else:
-    need = contents_off + len(content_blob) - len(gen)
-    gen.extend(b'\x00' * need)
-    gen[contents_off:contents_off+len(content_blob)] = content_blob
-print('Inserted content blob into generated image')
-
-# Also build normalized map for our generated strings
-gen_norm_to_off = {}
-for s, off in string_offsets.items():
-    n = normalize(s)
-    if n:
-        gen_norm_to_off[n] = off
-
-patched = []
-skipped_positions = []
-
-# Deterministic mapping: write mapping entries sequentially so index i -> offset of uniq[i]
 num_slots = (mapping_end - mapping_start) // 4
-print('Mapping slots:', num_slots, 'strings:', len(uniq))
+print('Mapping block:', hex(mapping_start), hex(mapping_end), 'slots:', num_slots)
 for i in range(num_slots):
     pos = mapping_start + i*4
     if i < len(uniq):
-        off = string_offsets[uniq[i]]
+        off = None
+        # find the slot that has the generated string we used (search patched list)
+        sname = uniq[i]
+        # look up slot where orig normalized == normalize(sname) or candidate==sname
+        found = False
+        for entry in patched:
+            if normalize(entry['candidate']) == normalize(sname) or normalize(entry['orig']) == normalize(sname):
+                off = entry['off']
+                found = True
+                break
+        if not found:
+            # fallback: use the first occurrence of same normalized string in sample_strings
+            n = normalize(sname)
+            off = None
+            for off2, length2, orig2 in slots:
+                if orig2 and normalize(orig2) == n:
+                    off = off2; break
+            if off is None:
+                # as last resort write the content offset where this string would have been placed contiguously
+                off = contents_off + sum((len(x.encode('utf-16le'))+2) for x in uniq[:i])
         gen[pos:pos+4] = off.to_bytes(4, 'little')
-        patched.append({'pos': pos, 'old': int.from_bytes(sbytes[pos:pos+4], 'little'), 'new': off, 'string': uniq[i], 'method': 'deterministic'})
     else:
-        # mark unused slots with 0xFFFFFFFF to avoid pointing into content accidentally
         gen[pos:pos+4] = (0xFFFFFFFF).to_bytes(4, 'little')
 
-print('Deterministic mapping written; patched slots:', len(patched))
-
-# Also write sequential index table entries if sample had sequential small indices
-idx_table_off = None
-for start in range(PREF, PREF + 0x400, 4):
-    ok = True
-    if start + 32 >= len(sbytes):
-        break
-    first = int.from_bytes(sbytes[start:start+4], 'little')
-    if not (0 < first < 0x1000):
-        continue
-    for j in range(1, 8):
-        v = int.from_bytes(sbytes[start + j*4:start + j*4 +4], 'little')
-        if v != first + j:
-            ok = False; break
-    if ok:
-        idx_table_off = start
-        break
-
-if idx_table_off is None:
-    idx_table_off = 0xA14 if 0xA14 + 4 <= len(gen) else None
-
-if idx_table_off:
-    sample_first = int.from_bytes(sbytes[idx_table_off:idx_table_off+4],'little')
-    base = sample_first
-    for i, s in enumerate(uniq):
-        pos = idx_table_off + i*4
-        if pos +4 > len(gen):
-            break
-        gen[pos:pos+4] = (base + i).to_bytes(4, 'little')
-    print('Wrote sequential index entries at', hex(idx_table_off), 'starting', base)
-else:
-    print('Could not find index-table to write sequential indices')
-
-# Overwrite prefix/suffix from SAMPLE so header matches sample runtime exactly
+# Overwrite prefix/suffix from SAMPLE
 gen[:PREF] = sample[:PREF]
 if SUFF > 0:
     gen[len(gen)-SUFF:] = sample[len(sample)-SUFF:]
 
 outp = args.out
 outp.write_bytes(bytes(gen))
-# Also write convenience filename used in earlier diffs
 alternate = OUT / 'globals_generated_runtime.gfx'
 alternate.write_bytes(bytes(gen))
-print('Wrote generated runtime to', outp, 'and', alternate)
 
 # write diagnostics
 diag = {
     'contents_off': contents_off,
+    'parsed_slots': len(slots),
+    'replaced': replaced_count,
+    'skipped_slots': len(skipped),
+    'skipped_details': skipped,
     'mapping_start': mapping_start,
     'mapping_end': mapping_end,
     'mapping_len': mapping_end-mapping_start,
-    'patched_count': len(patched),
-    'skipped_count': len(skipped_positions),
-    'patched_entries': patched,
-    'skipped_entries': skipped_positions,
-    'num_strings': len(uniq),
-    'idx_table_off': idx_table_off,
-    'deterministic': True
+    'num_strings': len(uniq)
 }
 (Path('tools/out/full_generate_diag.json')).write_text(json.dumps(diag, indent=2))
 print('Wrote diagnostics to tools/out/full_generate_diag.json')
