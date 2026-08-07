@@ -181,6 +181,9 @@ def pick_best(sample_str):
         if score > best_score:
             best_score = score
             best_s = gs
+    # enforce threshold
+    if best_score < args.match_threshold:
+        return None, best_score
     return best_s, best_score
 
 # iterate slots and replace in-place if matched and fits
@@ -194,7 +197,7 @@ for off, length, s in slots:
         continue
     best_s, score = pick_best(s)
     if best_s is None:
-        skipped.append({'off': off, 'len': length, 'orig': s, 'reason': 'no_candidate'})
+        skipped.append({'off': off, 'len': length, 'orig': s, 'reason': 'no_candidate', 'score': score})
         continue
     # encode candidate
     enc = best_s.encode('utf-16le') + b'\x00\x00'
@@ -211,13 +214,33 @@ for off, length, s in slots:
 
 print('Replaced', replaced_count, 'slots; skipped', len(skipped))
 
-# Deterministic mapping table write (same as before)
-# Heuristic: locate mapping block
+# Build normalized slot -> offset map to write mapping table deterministically
+map_norm_to_off = {}
+for off, length, orig in slots:
+    if not orig or orig is None:
+        continue
+    n = normalize(orig)
+    if not n:
+        continue
+    # prefer larger slot if duplicate normalized key
+    prev = map_norm_to_off.get(n)
+    if prev is None:
+        map_norm_to_off[n] = off
+    else:
+        # keep the one with larger slot length (prefer room)
+        # find prev length
+        for o2, l2, _ in slots:
+            if o2 == prev:
+                if length > l2:
+                    map_norm_to_off[n] = off
+                break
+
+# Deterministic mapping table write (improved)
 search_lo = 0x0400
 search_hi = min(0x2000, file_len - 4)
 window_u32s = 256
 best = None
-best_score = 0
+best_score = -1
 for start in range(search_lo, search_hi - window_u32s*4, 4):
     cnt = 0
     for i in range(window_u32s):
@@ -229,7 +252,11 @@ for start in range(search_lo, search_hi - window_u32s*4, 4):
         best_score = cnt
         best = start
 
-mapping_start = best
+if best is None:
+    print('Could not locate mapping table heuristically; aborting mapping write')
+    mapping_start = search_lo
+else:
+    mapping_start = best
 mapping_end = mapping_start + window_u32s*4
 # trim leading/ trailing 0xFF sequences
 while mapping_start < mapping_end and all(b == 0xFF for b in sbytes[mapping_start:mapping_start+4]):
@@ -242,27 +269,19 @@ print('Mapping block:', hex(mapping_start), hex(mapping_end), 'slots:', num_slot
 for i in range(num_slots):
     pos = mapping_start + i*4
     if i < len(uniq):
-        off = None
-        # find the slot that has the generated string we used (search patched list)
         sname = uniq[i]
-        # look up slot where orig normalized == normalize(sname) or candidate==sname
-        found = False
-        for entry in patched:
-            if normalize(entry['candidate']) == normalize(sname) or normalize(entry['orig']) == normalize(sname):
-                off = entry['off']
-                found = True
-                break
-        if not found:
-            # fallback: use the first occurrence of same normalized string in sample_strings
-            n = normalize(sname)
-            off = None
-            for off2, length2, orig2 in slots:
-                if orig2 and normalize(orig2) == n:
-                    off = off2; break
-            if off is None:
-                # as last resort write the content offset where this string would have been placed contiguously
-                off = contents_off + sum((len(x.encode('utf-16le'))+2) for x in uniq[:i])
-        gen[pos:pos+4] = off.to_bytes(4, 'little')
+        n = normalize(sname)
+        off = map_norm_to_off.get(n)
+        if off is None:
+            # try to find a patched entry matching this name
+            for entry in patched:
+                if normalize(entry.get('candidate','')) == n or normalize(entry.get('orig','')) == n:
+                    off = entry['off']; break
+        if off is None:
+            # not found -> write sentinel
+            gen[pos:pos+4] = (0xFFFFFFFF).to_bytes(4, 'little')
+        else:
+            gen[pos:pos+4] = int(off).to_bytes(4, 'little')
     else:
         gen[pos:pos+4] = (0xFFFFFFFF).to_bytes(4, 'little')
 
