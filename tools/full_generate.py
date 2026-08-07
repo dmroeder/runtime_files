@@ -2,15 +2,17 @@
 """
 tools/full_generate.py
 
-Deterministic in-place content patching.
+Deterministic in-place content patching with marker-packing.
 
-This change updates the generator to patch strings in-place inside the
-sample content area (starting at the "Contents" marker) rather than
-replacing it with a single contiguous blob. That preserves runtime
-markers (0xFFFF sequences, separators) and writes generated strings only
-into the same offsets the runtime expects. If a generated string is
-longer than the sample slot it replaces, we will skip that slot (emit a
-warning) to avoid shifting the runtime layout.
+This version extends the in-place patcher by using contiguous 0xFFFF
+marker runs inside the content area as a safe "heap" to store longer
+generated strings. Packing policy:
+ - Only overwrite bytes that are 0xFF (marker bytes) inside the
+   content area (do not touch non-marker slots).
+ - Place larger encoded strings first (best-fit first-fit) to use marker
+   regions efficiently.
+ - Update the deterministic mapping table to point to the actual
+   offsets where strings were placed.
 
 Usage:
   python3 tools/full_generate.py --out tools/out/globals_full_generated.gfx
@@ -26,7 +28,7 @@ import re
 import json
 import argparse
 import unicodedata
-import difflib
+from difflib import SequenceMatcher
 
 ROOT = Path('.').resolve()
 TOOLS = ROOT / 'tools'
@@ -123,8 +125,10 @@ for s in uniq:
 sbytes = sample
 file_len = len(sbytes)
 slots = []
+# limit scanning to content area (avoid trailing data)
+scan_end = min(file_len, changed_end)
 p = contents_off
-while p + 1 < file_len:
+while p + 1 < scan_end:
     # if marker (0xFFFF x N) or all FF's in next 2 bytes, treat as marker and advance by 2
     if sbytes[p:p+2] == b'\xff\xff':
         # record marker slot
@@ -133,7 +137,7 @@ while p + 1 < file_len:
         continue
     # otherwise, read until null terminator (utf-16le)
     end = p
-    while end + 1 < min(file_len, p + 4096):
+    while end + 1 < min(scan_end, p + 4096):
         if sbytes[end:end+2] == b'\x00\x00':
             break
         end += 2
@@ -160,8 +164,6 @@ skipped = []
 replaced_count = 0
 
 # function to pick best matching generated string for a sample string
-from difflib import SequenceMatcher
-
 def pick_best(sample_str):
     n = normalize(sample_str)
     if not n:
@@ -189,7 +191,7 @@ def pick_best(sample_str):
 # iterate slots and replace in-place if matched and fits
 for off, length, s in slots:
     if s is None:
-        # marker, skip
+        # marker, skip for now
         continue
     if s == '':
         # empty slot; skip
@@ -228,14 +230,98 @@ for off, length, orig in slots:
         map_norm_to_off[n] = off
     else:
         # keep the one with larger slot length (prefer room)
-        # find prev length
         for o2, l2, _ in slots:
             if o2 == prev:
                 if length > l2:
                     map_norm_to_off[n] = off
                 break
 
-# Deterministic mapping table write (improved)
+# Marker-packing: find contiguous 0xFF runs inside the content area (aligned to 2 bytes)
+marker_runs = []
+start = None
+p = contents_off
+while p < scan_end:
+    if sbytes[p] == 0xFF:
+        if start is None:
+            start = p
+    else:
+        if start is not None:
+            run_len = p - start
+            # ensure even length for utf-16le
+            if run_len >= 4:
+                if run_len % 2 != 0:
+                    run_len -= 1
+                marker_runs.append([start, run_len])
+            start = None
+    p += 1
+if start is not None:
+    run_len = scan_end - start
+    if run_len >= 4:
+        if run_len % 2 != 0:
+            run_len -= 1
+        marker_runs.append([start, run_len])
+
+# merge adjacent or overlapping runs (defensive)
+marker_runs.sort()
+merged = []
+for srun in marker_runs:
+    if not merged:
+        merged.append(srun)
+    else:
+        last = merged[-1]
+        if srun[0] <= last[0] + last[1]:
+            # overlap/adjacent
+            end = max(last[0] + last[1], srun[0] + srun[1])
+            last[1] = end - last[0]
+        else:
+            merged.append(srun)
+marker_runs = merged
+
+print('Found', len(marker_runs), 'marker runs (bytes) in content area')
+
+# Prepare list of candidates that are not already placed (by normalization)
+candidates = []
+for s in uniq:
+    n = normalize(s)
+    if not n:
+        continue
+    # skip if already mapped to a non-marker slot
+    if n in map_norm_to_off:
+        continue
+    enc = s.encode('utf-16le') + b'\x00\x00'
+    # only consider if fits in any run (we'll pack largest-first)
+    candidates.append((len(enc), n, s, enc))
+# sort largest-first
+candidates.sort(reverse=True)
+
+marker_placements = []
+# pack candidates into marker runs (first-fit)
+for clen, n, stext, enc in candidates:
+    placed = False
+    for idx, (mstart, mlen) in enumerate(marker_runs):
+        if clen <= mlen:
+            # place at mstart
+            gen[mstart:mstart+len(enc)] = enc
+            # pad remainder with 0x00
+            if len(enc) < mlen:
+                gen[mstart+len(enc):mstart+mlen] = b'\x00' * (mlen - len(enc))
+            # record placement
+            map_norm_to_off[n] = mstart
+            marker_placements.append({'norm': n, 'off': mstart, 'len': clen, 'run_idx': idx})
+            # shrink run: move start forward
+            marker_runs[idx][0] = mstart + clen
+            marker_runs[idx][1] = mlen - clen
+            if marker_runs[idx][1] < 4:
+                # remove tiny remainder
+                marker_runs[idx][1] = 0
+            placed = True
+            break
+    # compact runs list to remove zero-length
+    marker_runs = [r for r in marker_runs if r[1] >= 4]
+
+print('Packed', len(marker_placements), 'candidates into marker runs')
+
+# After marker packing, write mapping table deterministically
 search_lo = 0x0400
 search_hi = min(0x2000, file_len - 4)
 window_u32s = 256
@@ -302,6 +388,8 @@ diag = {
     'replaced': replaced_count,
     'skipped_slots': len(skipped),
     'skipped_details': skipped,
+    'marker_runs_found': len(marker_runs) + len(marker_placements),
+    'marker_placements': marker_placements,
     'mapping_start': mapping_start,
     'mapping_end': mapping_end,
     'mapping_len': mapping_end-mapping_start,
